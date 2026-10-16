@@ -1,0 +1,161 @@
+# ============================================================
+# AWS Infrastructure Configuration
+# Update these values for your AWS account before deployment
+# ============================================================
+
+project:
+  name: ecommerce-data-warehouse
+  environment: dev  # dev | staging | prod
+  region: us-east-1
+  tags:
+    Project: ecommerce-data-warehouse
+    Owner: data-engineering
+    ManagedBy: terraform
+
+# --- S3 Configuration ---
+s3:
+  data_lake_bucket: ecommerce-dw-data-lake-${AWS_ACCOUNT_ID}
+  scripts_bucket: ecommerce-dw-scripts-${AWS_ACCOUNT_ID}
+  logs_bucket: ecommerce-dw-logs-${AWS_ACCOUNT_ID}
+
+  # Partitioned prefixes for raw data landing zone
+  raw_data_prefixes:
+    clickstream: raw/clickstream/
+    orders: raw/orders/
+    order_line_items: raw/order_line_items/
+    users: raw/dimensions/users/
+    products: raw/dimensions/products/
+
+  # Processed data prefixes (output of Glue ETL)
+  processed_data_prefixes:
+    clickstream: processed/clickstream/
+    orders: processed/orders/
+    order_line_items: processed/order_line_items/
+
+  lifecycle_rules:
+    raw_data_retention_days: 90
+    processed_data_retention_days: 365
+    log_retention_days: 30
+
+# --- Kinesis Data Firehose ---
+kinesis:
+  delivery_streams:
+    - name: ecommerce-clickstream-stream
+      source_type: DirectPut  # or KinesisStream
+      destination: s3
+      s3_prefix: raw/clickstream/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/
+      s3_error_prefix: errors/clickstream/
+      buffer_size_mb: 64
+      buffer_interval_seconds: 300
+      compression: GZIP
+
+    - name: ecommerce-orders-stream
+      source_type: DirectPut
+      destination: s3
+      s3_prefix: raw/orders/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/
+      s3_error_prefix: errors/orders/
+      buffer_size_mb: 32
+      buffer_interval_seconds: 300
+      compression: GZIP
+
+# --- AWS Glue ---
+glue:
+  database_name: ecommerce_catalog
+  crawler:
+    name: ecommerce-raw-data-crawler
+    schedule: cron(0 2 * * ? *)  # 2 AM UTC daily
+    targets:
+      - s3://ecommerce-dw-data-lake-${AWS_ACCOUNT_ID}/raw/
+
+  jobs:
+    - name: etl-clickstream-transform
+      script_location: s3://ecommerce-dw-scripts/glue/etl_clickstream.py
+      worker_type: G.1X
+      number_of_workers: 5
+      glue_version: "4.0"
+      timeout_minutes: 60
+
+    - name: etl-orders-transform
+      script_location: s3://ecommerce-dw-scripts/glue/etl_orders.py
+      worker_type: G.1X
+      number_of_workers: 3
+      glue_version: "4.0"
+      timeout_minutes: 45
+
+    - name: etl-load-facts
+      script_location: s3://ecommerce-dw-scripts/glue/etl_load_facts.py
+      worker_type: G.1X
+      number_of_workers: 5
+      glue_version: "4.0"
+      timeout_minutes: 60
+
+# --- Amazon Redshift ---
+redshift:
+  cluster:
+    identifier: ecommerce-dw-cluster
+    node_type: ra3.xlplus     # RA3 for managed storage
+    number_of_nodes: 2        # Multi-node for production
+    database_name: ecommerce_dw
+    master_username: dw_admin
+    # master_password: Set via AWS Secrets Manager
+    port: 5439
+    publicly_accessible: false
+    encrypted: true
+
+  vpc:
+    subnet_group: ecommerce-dw-subnet-group
+    security_group: ecommerce-dw-sg
+    # Allow inbound on 5439 from Airflow, Glue, QuickSight
+
+  workload_management:
+    queues:
+      - name: etl_queue
+        memory_percent: 40
+        concurrency: 5
+        timeout_ms: 600000      # 10 minutes
+        user_groups: [etl_user]
+      - name: bi_queue
+        memory_percent: 40
+        concurrency: 15
+        timeout_ms: 300000      # 5 minutes
+        user_groups: [bi_user]
+      - name: default_queue
+        memory_percent: 20
+        concurrency: 5
+
+# --- Airflow (MWAA) ---
+airflow:
+  environment_name: ecommerce-dw-airflow
+  airflow_version: "2.8.1"
+  environment_class: mw1.medium
+  max_workers: 5
+  scheduler_count: 2
+  dags_s3_path: s3://ecommerce-dw-scripts/airflow/dags/
+  requirements_s3_path: s3://ecommerce-dw-scripts/airflow/requirements.txt
+
+  connections:
+    - conn_id: aws_default
+      conn_type: aws
+    - conn_id: redshift_default
+      conn_type: redshift
+      host: ecommerce-dw-cluster.xxxx.us-east-1.redshift.amazonaws.com
+      schema: ecommerce_dw
+      login: dw_admin
+      port: 5439
+
+# --- IAM Roles ---
+iam:
+  roles:
+    firehose_role: ecommerce-dw-firehose-role
+    glue_role: ecommerce-dw-glue-role
+    redshift_role: ecommerce-dw-redshift-role
+    airflow_role: ecommerce-dw-airflow-role
+
+  # Redshift role needs S3 read access for COPY commands
+  redshift_s3_policy:
+    actions:
+      - s3:GetObject
+      - s3:ListBucket
+    resources:
+      - arn:aws:s3:::ecommerce-dw-data-lake-*
+      - arn:aws:s3:::ecommerce-dw-data-lake-*/*
